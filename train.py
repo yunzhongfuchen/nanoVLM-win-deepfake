@@ -8,14 +8,14 @@ import argparse
 import torch.optim as optim
 from dataclasses import asdict
 from datasets import load_dataset, concatenate_datasets
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, random_split
 
 torch.manual_seed(0)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(0)
 
 from data.collators import VQACollator, MMStarCollator
-from data.datasets import MMStarDataset, VQADataset
+from data.datasets import MMStarDataset, VQADataset, AuthFolderDataset
 from data.processors import get_image_processor, get_tokenizer
 from models.vision_language_model import VisionLanguageModel
 import models.config as config
@@ -33,6 +33,12 @@ def get_run_name(train_cfg):
     date = time.strftime("%m%d")
 
     return f"nanoVLM_{dataset_size}_{batch_size}_{epochs}_{learning_rate}_{date}"
+
+def seed_worker(worker_id):
+    worker_seed = torch.initial_seed() % 2**32
+    numpy.random.seed(worker_seed)
+    random.seed(worker_seed)
+
 
 def get_dataloaders(train_cfg, vlm_cfg):
     # Create datasets
@@ -66,10 +72,10 @@ def get_dataloaders(train_cfg, vlm_cfg):
     vqa_collator = VQACollator(tokenizer, vlm_cfg.lm_max_length)
     mmstar_collator = MMStarCollator(tokenizer)
 
-    def seed_worker(worker_id):
-        worker_seed = torch.initial_seed() % 2**32
-        numpy.random.seed(worker_seed)
-        random.seed(worker_seed)
+    # def seed_worker(worker_id):
+    #     worker_seed = torch.initial_seed() % 2**32
+    #     numpy.random.seed(worker_seed)
+    #     random.seed(worker_seed)
 
     g = torch.Generator()
     g.manual_seed(0)
@@ -111,6 +117,94 @@ def get_dataloaders(train_cfg, vlm_cfg):
 
     return train_loader, val_loader, test_loader
 
+def get_dataloader_win(train_cfg, vlm_cfg):
+    # 1. tokenizer & image_processor
+    image_processor = get_image_processor(vlm_cfg.vit_img_size)
+    tokenizer = get_tokenizer(vlm_cfg.lm_tokenizer)
+
+    # 2. 随机种子（用于划分 train/val + DataLoader）
+    g = torch.Generator()
+    g.manual_seed(0)
+
+    # 3. 训练+验证数据：从 train_dataset_path 下的 real/tampered/full_synthetic 读取
+    train_root = train_cfg.train_dataset_path  # 例如：D:/data/train_auth
+    full_train_dataset = AuthFolderDataset(
+        root_dir=train_root,
+        tokenizer=tokenizer,
+        image_processor=image_processor,
+    )
+
+    # 4. 可选 data_cutoff_idx 截断
+    if train_cfg.data_cutoff_idx is None:
+        base_dataset = full_train_dataset
+    else:
+        max_idx = min(len(full_train_dataset), train_cfg.data_cutoff_idx)
+        indices = list(range(max_idx))
+        base_dataset = torch.utils.data.Subset(full_train_dataset, indices)
+
+    total_samples = len(base_dataset)
+
+    # 5. 按 val_ratio 划分 train / val
+    val_size = int(total_samples * train_cfg.val_ratio)
+    train_size = total_samples - val_size
+
+    train_dataset, val_dataset = random_split(
+        base_dataset,
+        [train_size, val_size],
+        generator=g,
+    )
+
+    # 6. 测试数据：同样方式，但从 test_dataset_path 路径下的三个文件夹读取
+    test_root = train_cfg.test_dataset_path   # 例如：D:/data/test_auth
+    test_dataset = AuthFolderDataset(
+        root_dir=test_root,
+        tokenizer=tokenizer,
+        image_processor=image_processor,
+    )
+
+    # 7. collator：训练 / 验证 / 测试全用 VQACollator
+    vqa_collator = VQACollator(tokenizer, vlm_cfg.lm_max_length)
+    mmstar_collator = MMStarCollator(tokenizer)
+
+    # 8. DataLoader（注意 seed_worker 要在文件顶层定义）
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=train_cfg.batch_size,
+        shuffle=True,
+        collate_fn=vqa_collator,
+        num_workers=8,
+        pin_memory=True,
+        drop_last=True,
+        worker_init_fn=seed_worker,
+        generator=g,
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=train_cfg.batch_size,
+        shuffle=False,
+        collate_fn=vqa_collator,
+        num_workers=8,
+        pin_memory=True,
+        drop_last=True,
+        worker_init_fn=seed_worker,
+        generator=g,
+    )
+
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=train_cfg.mmstar_batch_size,  # 你原来的 test batch size
+        shuffle=False,
+        collate_fn=mmstar_collator,
+        num_workers=8,
+        pin_memory=True,
+        drop_last=False,
+        worker_init_fn=seed_worker,
+        generator=g,
+    )
+
+    return train_loader, val_loader, test_loader
+
 def test_mmstar(model, tokenizer, test_loader, device):
     model.eval()
     total_examples = 0
@@ -136,6 +230,66 @@ def test_mmstar(model, tokenizer, test_loader, device):
     accuracy = correct_predictions / total_examples if total_examples > 0 else 0
     return accuracy
 
+def test_auth_dataset(model, tokenizer, test_loader, device):
+    model.eval()
+    total = 0
+    correct = 0
+
+    with torch.no_grad():
+        for batch in test_loader:
+            images = batch["images"].to(device)
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            labels = batch["labels"].to(device)  # [B, T]
+
+            batch_size = input_ids.size(0)
+
+            # 1) 从 labels 提取“答案文本”
+            gt_answers = []
+            for i in range(batch_size):
+                label_ids = labels[i]
+                # 只取 label != -100 的 token，忽略问题部分
+                ans_ids = label_ids[label_ids != -100]
+                if ans_ids.numel() == 0:
+                    gt_answers.append("")
+                else:
+                    gt = tokenizer.decode(ans_ids, skip_special_tokens=True)
+                    gt_answers.append(gt.strip().lower())
+
+            # 2) 让模型生成答案
+            gen_ids = model.generate(input_ids, images, attention_mask)
+            pred_answers = tokenizer.batch_decode(gen_ids, skip_special_tokens=True)
+            pred_answers = [p.strip().lower() for p in pred_answers]
+
+            # 3) 比较预测和真实答案
+            for pred, gt in zip(pred_answers, gt_answers):
+                # 可选：把答案简化成标签
+                # 例如 "the image is real" -> "real"
+                if "real" in gt:
+                    gt_label = "real"
+                elif "tampered" in gt:
+                    gt_label = "tampered"
+                elif "full" in gt and "synthetic" in gt:
+                    gt_label = "full_synthetic"
+                else:
+                    gt_label = gt  # fallback
+
+                if "real" in pred:
+                    pred_label = "real"
+                elif "tampered" in pred:
+                    pred_label = "tampered"
+                elif "full" in pred and "synthetic" in pred:
+                    pred_label = "full_synthetic"
+                else:
+                    pred_label = pred  # fallback
+
+                if gt_label == pred_label:
+                    correct += 1
+                total += 1
+
+    model.train()
+    return correct / total if total > 0 else 0.0
+
 # Cosine learning rate schedule with warmup (from Karpathy)
 # https://github.com/karpathy/build-nanogpt/blob/master/train_gpt2.py#L353
 def get_lr(it, max_lr, max_steps):
@@ -154,7 +308,7 @@ def get_lr(it, max_lr, max_steps):
     return min_lr + coeff * (max_lr - min_lr)
 
 def train(train_cfg, vlm_cfg):
-    train_loader, val_loader, test_loader = get_dataloaders(train_cfg, vlm_cfg)
+    train_loader, val_loader, test_loader = get_dataloader_win(train_cfg, vlm_cfg)
     tokenizer = get_tokenizer(vlm_cfg.lm_tokenizer)
 
     total_dataset_size = len(train_loader.dataset)
@@ -239,7 +393,7 @@ def train(train_cfg, vlm_cfg):
                 model.eval()
                 torch.cuda.empty_cache()  # Clear GPU memory
                 with torch.no_grad():
-                    epoch_accuracy = test_mmstar(model, tokenizer, test_loader, device)
+                    epoch_accuracy = test_auth_dataset(model, tokenizer, test_loader, device)
                     total_val_loss = 0
                     for batch in val_loader:
                         images = batch["image"].to(device)
@@ -293,7 +447,7 @@ def train(train_cfg, vlm_cfg):
     print(f"Average time per epoch: {avg_epoch_time:.2f}s")
     print(f"Average time per sample: {avg_time_per_sample:.4f}s")
 
-    accuracy = test_mmstar(model, tokenizer, test_loader, device)
+    accuracy = test_auth_dataset(model, tokenizer, test_loader, device)
     print(f"MMStar Accuracy: {accuracy:.4f}")
 
     if train_cfg.log_wandb:

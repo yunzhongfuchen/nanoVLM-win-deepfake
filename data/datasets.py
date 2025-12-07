@@ -89,4 +89,103 @@ class MMStarDataset(Dataset):  # https://huggingface.co/datasets/Lin-Chen/MMStar
             "text_data": formatted_text,
             "answer": answer
         }
-    
+
+
+import os
+from pathlib import Path
+
+
+class AuthFolderDataset(Dataset):
+    """
+    从一个大目录下的三个子文件夹(real, tampered, full_synthetic)读取图片，
+    并把类别转成文本答案，例如:
+        real          -> "The image is real"
+        tampered      -> "The image is tampered"
+        full_synthetic-> "The image is full synthetic"
+
+    输出格式与 VQADataset 一致：
+        {
+            "image": processed_image,   # tensor [3, H, W]
+            "text_data": formatted_text,# 问句 Prompt
+            "answer": answer_text       # 文本答案 + eos_token
+        }
+    这样就能直接接 VQACollator 使用。
+    """
+
+    def __init__(self, root_dir, tokenizer, image_processor):
+        """
+        :param root_dir: 根目录路径，下面有 real / tampered / full_synthetic 三个子目录
+        :param tokenizer: 训练用 tokenizer，用来拿 eos_token
+        :param image_processor: 官方 get_image_processor 得到的图像预处理
+        """
+        self.root_dir = Path(root_dir)
+        self.tokenizer = tokenizer
+        self.image_processor = image_processor
+
+        # 文件夹名 -> 文本答案
+        self.class_to_answer = {
+            "real": "The image is real",
+            "tampered": "The image is tampered",
+            "full_synthetic": "The image is full synthetic",
+        }
+        self.class_names = list(self.class_to_answer.keys())
+
+        # 收集样本 (path, class_name)
+        self.samples = []
+        exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+
+        for cls in self.class_names:
+            cls_dir = self.root_dir / cls
+            if not cls_dir.is_dir():
+                print(f"[WARN] 子目录不存在: {cls_dir}")
+                continue
+
+            for fname in os.listdir(cls_dir):
+                path = cls_dir / fname
+                if path.suffix.lower() not in exts:
+                    continue
+                self.samples.append((path, cls))
+
+        if len(self.samples) == 0:
+            raise RuntimeError(
+                f"在 {self.root_dir} 下没有找到任何图片（real/tampered/full_synthetic）"
+            )
+
+        print(f"[INFO] AuthFolderDataset: 共 {len(self.samples)} 张图片")
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        img_path, cls_name = self.samples[idx]
+
+        # --- 读图 ---
+        try:
+            image = Image.open(img_path)
+        except Exception as e:
+            print(f"[ERROR] 打开图片失败: {img_path}, error: {e}")
+            processed_image = torch.zeros(
+                3, cfg.VLMConfig.vit_img_size, cfg.VLMConfig.vit_img_size
+            )
+        else:
+            if image.mode != "RGB":
+                image = image.convert("RGB")
+            processed_image = self.image_processor(image)
+
+        # --- 构造 QA 文本 ---
+        # 问题你可以随便改，这里给一个示例
+        question = "Classify the authenticity of this image as real, tampered, or full synthetic."
+        # 根据文件夹生成答案
+        answer_text = self.class_to_answer[cls_name]
+
+        # 加 eos，让模型学会何时停
+        answer = answer_text + self.tokenizer.eos_token * 3
+
+        # 跟官方 VQADataset 的格式保持一致
+        formatted_text = f"Question: {question} Answer:"
+
+        return {
+            "image": processed_image,
+            "text_data": formatted_text,
+            "answer": answer,
+        }
